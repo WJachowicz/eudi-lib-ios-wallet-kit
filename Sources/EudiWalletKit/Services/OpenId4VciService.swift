@@ -436,7 +436,7 @@ public actor OpenId4VciService {
 		return (issuer, dpopConstructor)
 	}
 
-	func authorizeOffer(offerUri: String, docTypeModels: [OfferedDocModel], txCodeValue: String?, authorized: AuthorizedRequest?, forceRefreshToken: Bool, backgroundOnly: Bool = false) async throws -> (AuthorizeRequestOutcome, Issuer, [CredentialConfiguration], [String: [RegistrationPolicyViolation]]?) {
+	func authorizeOffer(offerUri: String, docTypeModels: [OfferedDocModel], txCodeValue: String?, authorized: AuthorizedRequest?, forceRefreshToken: Bool, backgroundOnly: Bool = false, additionalAuthorizationParameters: [String: String]) async throws -> (AuthorizeRequestOutcome, Issuer, [CredentialConfiguration], [String: [RegistrationPolicyViolation]]?) {
 		guard let offer = Self.credentialOfferCache[offerUri] else {
 			throw WalletError(description: "offerUri \(offerUri) not resolved. resolveOfferDocTypes must be called first", code: .internalError)
 		}
@@ -468,7 +468,11 @@ public actor OpenId4VciService {
 			let authorized = try await issuer.authorizeWithPreAuthorizationCode(credentialOffer: offer, authorizationCode: authCode, client: vciConfig.client, transactionCode: txCodeValue)
 			authorizedOutcome = .authorized(authorized)
 		} else if !backgroundOnly {
-			authorizedOutcome = try await authorizeRequestWithAuthCodeUseCase(issuer: issuer, offer: offer)
+			authorizedOutcome = try await authorizeRequestWithAuthCodeUseCase(
+				issuer: issuer,
+				offer: offer,
+				additionalAuthorizationParameters: additionalAuthorizationParameters
+			)
 		} else {
 			throw WalletError(description: "Offer requires user interaction for authorization, but backgroundOnly is set to true, forced refresh token is \(forceRefreshToken).", code: .authorizationFailed)
 		}
@@ -536,8 +540,9 @@ public actor OpenId4VciService {
 	///   - credentialOptions: Credential options specifying batch size and credential policy. If nil, defaults from the configuration are used.
 	///   - keyOptions: Key options (secure area name and other options) for the document issuing (optional)
 	///   - promptMessage: Prompt message for biometric authentication (optional)
+	///   - additionalAuthorizationParameters: custom OAuth/OpenID authorization request parameters to be included in the Authorization Request or Pushed Authorization Request (PAR) (optional)
 	/// - Returns: Array of issued documents. They are saved in storage.
-	@discardableResult func reissueDocument(documentId: WalletStorage.Document.ID, docMetadata: DocMetadata, authorized: AuthorizedRequest? = nil, credentialOptions: CredentialOptions? = nil, keyOptions: KeyOptions? = nil, promptMessage: String? = nil, backgroundOnly: Bool = false) async throws -> [WalletStorage.Document] {
+	@discardableResult func reissueDocument(documentId: WalletStorage.Document.ID, docMetadata: DocMetadata, authorized: AuthorizedRequest? = nil, credentialOptions: CredentialOptions? = nil, keyOptions: KeyOptions? = nil, promptMessage: String? = nil, backgroundOnly: Bool = false, additionalAuthorizationParameters: [String: String]? = nil) async throws -> [WalletStorage.Document] {
 		let (credentialConfigurations, offer) = try await buildCredentialOffer(for: [.identifier(docMetadata.configurationIdentifier)])
 		let credentialConfiguration = credentialConfigurations.first!
 		let offerUri = UUID().uuidString
@@ -546,7 +551,18 @@ public actor OpenId4VciService {
 		// Background retries for the same stored document update one transaction, and interactive calls create separate transactions.
 		let transactionId = backgroundOnly ? "background-reissuance:" + documentId : UUID().uuidString
 		let reissueAction: (Bool) async throws -> [WalletStorage.Document] = { forceRefreshToken in
-			return try await self.issueDocumentsByOfferUrl(offerUri: offerUri, docTypes: docTypes, authorized: authorized, forceRefreshToken: forceRefreshToken, documentId: documentId, txCodeValue: nil, promptMessage: promptMessage, backgroundOnly: backgroundOnly, issuanceTransactionIds: [transactionId])
+			return try await self.issueDocumentsByOfferUrl(
+				offerUri: offerUri,
+				docTypes: docTypes,
+				authorized: authorized,
+				forceRefreshToken: forceRefreshToken,
+				documentId: documentId,
+				txCodeValue: nil,
+				promptMessage: promptMessage,
+				backgroundOnly: backgroundOnly,
+				issuanceTransactionIds: [transactionId],
+				additionalAuthorizationParameters: additionalAuthorizationParameters ?? [:]
+			)
 		}
 		do {
 			return try await reissueAction(false)
@@ -568,8 +584,9 @@ public actor OpenId4VciService {
 	///   - credentialOptions: Credential options specifying batch size and credential policy. If nil, defaults are fetched from issuer metadata.
 	///   - keyOptions: Key options (secure area name and other options) for the document issuing (optional)
 	///   - promptMessage: Prompt message for biometric authentication (optional)
+	///   - additionalAuthorizationParameters: custom OAuth/OpenID authorization request parameters to be included in the Authorization Request or Pushed Authorization Request (PAR) (optional)
 	/// - Returns: Array of issued documents. They are saved in storage.
-	@discardableResult public func issueDocuments(docTypeIdentifiers: [DocTypeIdentifier], credentialOptions: CredentialOptions? = nil, keyOptions: KeyOptions? = nil, promptMessage: String? = nil) async throws -> [WalletStorage.Document] {
+	@discardableResult public func issueDocuments(docTypeIdentifiers: [DocTypeIdentifier], credentialOptions: CredentialOptions? = nil, keyOptions: KeyOptions? = nil, promptMessage: String? = nil, additionalAuthorizationParameters: [String: String]? = nil) async throws -> [WalletStorage.Document] {
 		if docTypeIdentifiers.isEmpty { return [] }
 		let (credentialConfigurations, offer) = try await buildCredentialOffer(for: docTypeIdentifiers)
 		// Cache the offer with a generated UUID
@@ -580,7 +597,15 @@ public actor OpenId4VciService {
 			makeOfferedDocModel(from: $0, credentialOptions: credentialOptions, keyOptions: keyOptions)
 		}
 		// Delegate to issueDocumentsByOfferUrl
-		return try await issueDocumentsByOfferUrl(offerUri: offerUri, docTypes: docTypes, authorized: nil, documentId: nil,  txCodeValue: nil, promptMessage: promptMessage)
+		return try await issueDocumentsByOfferUrl(
+			offerUri: offerUri,
+			docTypes: docTypes,
+			authorized: nil,
+			documentId: nil,
+			txCodeValue: nil,
+			promptMessage: promptMessage,
+			additionalAuthorizationParameters: additionalAuthorizationParameters ?? [:]
+		)
 	}
 
 	/// Issue documents by offer URI.
@@ -590,8 +615,9 @@ public actor OpenId4VciService {
 	///   - txCodeValue: Transaction code given to user (if available)
 	///   - promptMessage: prompt message for biometric authentication (optional)
 	///   - issuanceTransactionIds: Stable log IDs per offered document, shared across retries. When omitted, each attempt uses its document IDs.
+	///   - additionalAuthorizationParameters: custom OAuth/OpenID authorization request parameters to be included in the Authorization Request or Pushed Authorization Request (PAR) (optional)
 	/// - Returns: Array of issued and stored documents
-	func issueDocumentsByOfferUrl(offerUri: String, docTypes: [OfferedDocModel], authorized: AuthorizedRequest?, forceRefreshToken: Bool = false, documentId: String?, txCodeValue: String? = nil, promptMessage: String? = nil, backgroundOnly: Bool = false, issuanceTransactionIds: [String]? = nil) async throws -> [WalletStorage.Document] {
+	func issueDocumentsByOfferUrl(offerUri: String, docTypes: [OfferedDocModel], authorized: AuthorizedRequest?, forceRefreshToken: Bool = false, documentId: String?, txCodeValue: String? = nil, promptMessage: String? = nil, backgroundOnly: Bool = false, issuanceTransactionIds: [String]? = nil, additionalAuthorizationParameters: [String: String]? = nil) async throws -> [WalletStorage.Document] {
 		if let issuanceTransactionIds, issuanceTransactionIds.count != docTypes.count {
 			throw WalletError(description: "Expected one issuance transaction ID per offered document", code: .internalError)
 		}
@@ -616,7 +642,15 @@ public actor OpenId4VciService {
 				openId4VCIServices.append(svc)
 			}
 			let authService = openId4VCIServices.first!
-			let (auth, issuer, credentialInfos, wrpVciWarnings) = try await authService.authorizeOffer(offerUri: offerUri, docTypeModels: docTypes, txCodeValue: txCodeValue, authorized: authorized, forceRefreshToken: forceRefreshToken, backgroundOnly: backgroundOnly)
+			let (auth, issuer, credentialInfos, wrpVciWarnings) = try await authService.authorizeOffer(
+				offerUri: offerUri,
+				docTypeModels: docTypes,
+				txCodeValue: txCodeValue,
+				authorized: authorized,
+				forceRefreshToken: forceRefreshToken,
+				backgroundOnly: backgroundOnly,
+				additionalAuthorizationParameters: additionalAuthorizationParameters ?? [:]
+			)
 			wrpIssuerWarnings = wrpVciWarnings
 			wrpIssuerPolicy = await authService.wrpIssuerPolicy
 			let clientId = await issuer.config.client.id
@@ -712,13 +746,16 @@ public actor OpenId4VciService {
 		return credentialInfos
 	}
 
-	private func authorizeRequestWithAuthCodeUseCase(issuer: Issuer, offer: CredentialOffer) async throws -> AuthorizeRequestOutcome {
+	private func authorizeRequestWithAuthCodeUseCase(issuer: Issuer, offer: CredentialOffer, additionalAuthorizationParameters: [String: String]) async throws -> AuthorizeRequestOutcome {
 		let pushedAuthorizationRequestEndpoint = if case let .oidc(metaData) = offer.authorizationServerMetadata, let endpoint = metaData.pushedAuthorizationRequestEndpoint { endpoint } else if case let .oauth(metaData) = offer.authorizationServerMetadata, let endpoint = metaData.pushedAuthorizationRequestEndpoint { endpoint } else { "" }
 		if config.parUsage.required && pushedAuthorizationRequestEndpoint.isEmpty {
 			logger.info("PAR not supported, Pushed Authorization Request Endpoint is nil")
 		}
 		logger.info("--> [AUTHORIZATION] Placing Request to AS server's endpoint \(pushedAuthorizationRequestEndpoint)")
-		let parPlaced = try await issuer.prepareAuthorizationRequest(credentialOffer: offer)
+		let parPlaced = try await issuer.prepareAuthorizationRequest(
+			credentialOffer: offer,
+			additionalAuthorizationParameters: additionalAuthorizationParameters
+		)
 
 		self.authRequested = parPlaced
 		logger.info("--> [AUTHORIZATION] Placed Request. Authorization code URL is: \(parPlaced.authorizationCodeURL)")
